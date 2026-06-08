@@ -1,4 +1,5 @@
 name: compile-fap
+# workflow-version: v2
 run-name: ${{ inputs.build_id }}
 on:
   workflow_dispatch:
@@ -47,14 +48,42 @@ jobs:
               entries=( * )
               if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
                 mv "${entries[0]}"/* .
-                rmdir "${entries[0]}"
+                rmdir "${entries[0]}" 2>/dev/null || true
               fi
               ;;
             repo)
-              git clone --depth 1 "${{ inputs.source_value }}" tmp
-              shopt -s dotglob
+              git clone --depth 1 "${{ inputs.source_value }}" tmp || {
+                echo "::error::git clone failed for ${{ inputs.source_value }}"; exit 1;
+              }
+              rm -rf tmp/.git
+              shopt -s dotglob nullglob
+              files=( tmp/* )
+              if [ ${#files[@]} -eq 0 ]; then
+                echo "::error::repo appears to be empty"; exit 1;
+              fi
               mv tmp/* .
               rm -rf tmp
+              # If no application.fam at root, try to locate the app.
+              if [ ! -f application.fam ]; then
+                APPDIR=""
+                # 1) exact match by app_name
+                cand=$(find . -maxdepth 4 -type d -iname "${{ inputs.app_name }}" -print -quit 2>/dev/null || true)
+                if [ -n "$cand" ] && [ -f "$cand/application.fam" ]; then APPDIR="$cand"; fi
+                # 2) any directory containing application.fam
+                if [ -z "$APPDIR" ]; then
+                  fam=$(find . -maxdepth 5 -type f -name application.fam -print -quit 2>/dev/null || true)
+                  if [ -n "$fam" ]; then APPDIR=$(dirname "$fam"); fi
+                fi
+                if [ -z "$APPDIR" ]; then
+                  echo "::error::no application.fam found anywhere in repo — this isn't a single .fap source tree"; exit 1;
+                fi
+                echo "Using app directory: $APPDIR"
+                mkdir -p ../_app && mv "$APPDIR"/* ../_app/
+                shopt -s dotglob
+                rm -rf ./* || true
+                mv ../_app/* .
+                rmdir ../_app 2>/dev/null || true
+              fi
               ;;
             inline)
               printf '%s' "${{ inputs.source_value }}" | base64 -d > main.c
@@ -74,6 +103,8 @@ jobs:
               ;;
           esac
           ls -la
+
+
       - name: Build
         working-directory: app
         run: ufbt
