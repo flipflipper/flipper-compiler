@@ -1,0 +1,102 @@
+name: compile-fap
+run-name: ${{ inputs.build_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      firmware:     { required: true, type: string }
+      source_type:  { required: true, type: string }
+      source_value: { required: true, type: string }
+      app_name:     { required: true, type: string }
+      build_id:     { required: true, type: string }
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install ufbt
+        run: pip install --upgrade ufbt
+      - name: Select firmware SDK
+        run: |
+          set -e
+          case "${{ inputs.firmware }}" in
+            ofw)         ufbt update --channel=release ;;
+            unleashed)   ufbt update --index-url=https://up.unleashedflip.com/directory.json --channel=release ;;
+            momentum)    ufbt update --index-url=https://up.momentum-fw.dev/firmware/directory.json --channel=release ;;
+            roguemaster) ufbt update --index-url=https://up.unleashedflip.com/directory.json --channel=release ;;
+            *) echo "unknown firmware"; exit 1 ;;
+          esac
+      - name: Stage source
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app
+          cd app
+          case "${{ inputs.source_type }}" in
+            zip)
+              cp "../${{ inputs.source_value }}" src.zip
+              unzip -o src.zip >/dev/null
+              rm src.zip
+              shopt -s dotglob nullglob
+              entries=( * )
+              if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+                mv "${entries[0]}"/* .
+                rmdir "${entries[0]}"
+              fi
+              ;;
+            repo)
+              git clone --depth 1 "${{ inputs.source_value }}" tmp
+              shopt -s dotglob
+              mv tmp/* .
+              rm -rf tmp
+              ;;
+            inline)
+              printf '%s' "${{ inputs.source_value }}" | base64 -d > main.c
+              SAFE='${{ inputs.app_name }}'
+              cat > application.fam <<EOF
+          App(
+              appid="${SAFE}",
+              name="${SAFE}",
+              apptype=FlipperAppType.EXTERNAL,
+              entry_point="${SAFE}_main",
+              requires=["gui"],
+              stack_size=2*1024,
+              fap_category="Misc",
+              sources=["*.c*"],
+          )
+          EOF
+              ;;
+          esac
+          ls -la
+      - name: Build
+        working-directory: app
+        run: ufbt
+      - name: Locate .fap
+        id: find
+        run: |
+          fap=$(find app/dist -name "*.fap" | head -n1)
+          test -n "$fap" || { echo "no .fap produced"; exit 1; }
+          echo "fap=$fap" >> $GITHUB_OUTPUT
+          echo "name=$(basename $fap)" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fap-${{ inputs.build_id }}
+          path: ${{ steps.find.outputs.fap }}
+          retention-days: 1
+      - name: Cleanup uploaded source
+        if: always() && inputs.source_type == 'zip'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          path="${{ inputs.source_value }}"
+          sha=$(gh api "repos/${{ github.repository }}/contents/$path" --jq .sha 2>/dev/null)
+          [ -n "$sha" ] && gh api -X DELETE "repos/${{ github.repository }}/contents/$path" \
+            -f message="cleanup ${{ inputs.build_id }}" -f sha="$sha"
+          exit 0
